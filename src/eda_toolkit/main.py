@@ -525,8 +525,9 @@ def contingency_table(
         if df[col].dtype.name == "category":
             df[col] = df[col].astype(str)
 
-    # Fill NA values in the dataframe
-    df = df.fillna("")
+    # Convert all values in dataframe to object 
+    # then fill NA values in the dataframe with empty spaces
+    df = df.astype(str).fillna("")
 
     # Create the contingency table with observed=True
     cont_df = (
