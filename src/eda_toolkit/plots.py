@@ -2789,9 +2789,10 @@ def flex_corr_matrix(
     filter_significance: Optional[float] = None,
     corr_threshold: Optional[float] = None,
     return_corr: bool = False,
+    return_sig: bool = False,
     show_plot: bool = False,
     **kwargs: Dict[str, Any],
-) -> Optional[pd.DataFrame]:
+) -> Optional[Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]]:
     """
     Creates a correlation heatmap with extensive customization options, including
     triangular masking, alignment adjustments, title wrapping, dynamic colorbar
@@ -2895,7 +2896,9 @@ def flex_corr_matrix(
 
     significance_level : float, optional (default=0.05)
         The p-value threshold below which a correlation is considered
-        statistically significant. Used in both "stars" and "mask" modes.
+        statistically significant. Gates both the star annotations ("stars"
+        mode) and the cell blanking ("mask" mode); cells with
+        p >= significance_level get no star or are blanked, respectively.
 
     significance_method : str, optional (default="stars")
         How to display significance on the heatmap. Options are:
@@ -2919,8 +2922,8 @@ def flex_corr_matrix(
         ``filter_significance=0.05`` drops any variable with no pairwise
         p-value below 0.05. Valid values are ``None`` (no filtering), or a
         float such as ``0.05``, ``0.01``, or ``0.001``.
-        When set, ``show_significance`` is automatically enabled so the
-        significance overlay is always visible alongside the filtered matrix.
+        When set, p-values are computed for filtering, but the significance
+        overlay is drawn only if ``show_significance=True``.
 
     corr_threshold : float or None, optional (default=None)
         If provided, drops any variable whose strongest off-diagonal absolute
@@ -2937,11 +2940,20 @@ def flex_corr_matrix(
         default this also suppresses the heatmap; pass `show_plot=True` to
         render it as well. If False, returns None and always plots.
 
+    return_sig : bool, optional (default=False)
+        If True, returns the pairwise p-value matrix (computed with
+        `corr_method`, after any `filter_significance` filtering) as a
+        DataFrame. The diagonal holds the initialized placeholder value of 1.
+        Like `return_corr`, this suppresses the heatmap by default; pass
+        `show_plot=True` to render it as well. If both `return_corr` and
+        `return_sig` are True, a tuple `(corr_matrix, pval_matrix)` is
+        returned.
+
     show_plot : bool, optional (default=False)
-        Only has an effect when `return_corr=True`. By default, requesting the
-        matrix with `return_corr=True` suppresses the heatmap and returns the
-        data only; set `show_plot=True` to also render the plot. When
-        `return_corr=False` the heatmap always displays and this flag is
+        Only has an effect when `return_corr=True` or `return_sig=True`. By
+        default, requesting a returned frame suppresses the heatmap and returns
+        the data only; set `show_plot=True` to also render the plot. When
+        neither return flag is set the heatmap always displays and this flag is
         ignored.
 
     **kwargs : dict, optional
@@ -2949,35 +2961,31 @@ def flex_corr_matrix(
 
     Returns:
     --------
-    pandas.DataFrame or None
-        The (possibly filtered) correlation matrix if `return_corr=True`,
-        otherwise None.
+    pandas.DataFrame, tuple of pandas.DataFrame, or None
+        - If `return_corr=True` only: the (possibly filtered) correlation
+          matrix.
+        - If `return_sig=True` only: the (possibly filtered) p-value matrix.
+        - If both are True: a tuple `(corr_matrix, pval_matrix)`.
+        - If neither is set: None (the heatmap is plotted).
 
     Raises:
     -------
     ValueError
         If `annot`, `save_plots`, or `triangular` is not a boolean value.
-
     ValueError
         If `cols` is provided but is not a list of column names.
-
     ValueError
         If `save_plots` is True but neither `image_path_png` nor `image_path_svg`
         is specified.
-
     ValueError
         If `image_filename` is provided but neither `image_path_png` nor
         `image_path_svg` is specified.
-
     ValueError
         If `corr_method` is not one of "pearson", "spearman", or "kendall".
-
     ValueError
         If `significance_method` is not one of "stars" or "mask".
-
     ValueError
         If `filter_significance` is not None and is not a positive float.
-
     ValueError
         If `corr_threshold` is not None and is not a number in [0, 1].
 
@@ -3001,6 +3009,9 @@ def flex_corr_matrix(
       displayed values may be below the threshold.
     - The returned matrix is the full square matrix; the triangular display
       mask is not applied to it.
+    - The p-value matrix returned by `return_sig=True` carries the initialized
+      value of 1 on its diagonal, since a variable has no p-value against
+      itself.
     """
 
     # Validation: Ensure annot is a boolean
@@ -3046,8 +3057,6 @@ def flex_corr_matrix(
                 "`filter_significance` must be a positive float (e.g. 0.05, 0.01, "
                 "0.001) or None."
             )
-        # Auto-enable show_significance so p-values are always computed
-        show_significance = True
 
     # Validate corr_threshold
     if corr_threshold is not None and (
@@ -3100,8 +3109,10 @@ def flex_corr_matrix(
         corr_matrix = df_numeric.corr(method=corr_method)
         corr_matrix = corr_matrix.where(corr_matrix.abs() >= 0.005, 0.0)
 
-    # Compute pairwise p-value matrix if significance is requested
-    if show_significance:
+    # Compute p-values when any consumer needs them: the stars/mask display,
+    # the variable filter, or the (optional) p-value return.
+    _need_pvalues = show_significance or filter_significance is not None or return_sig
+    if _need_pvalues:
         from scipy import stats as _stats
 
         n_cols = len(df_numeric.columns)
@@ -3142,7 +3153,7 @@ def flex_corr_matrix(
             pval_matrix = pval_matrix.loc[cols_to_keep, cols_to_keep]
 
         def _stars(p):
-            if pd.isna(p) or p >= 0.05:
+            if pd.isna(p) or p >= significance_level:
                 return ""
             elif p < 0.001:
                 return "***"
@@ -3196,7 +3207,7 @@ def flex_corr_matrix(
 
     # Plot unless the caller is pulling the dataframe and opted out.
     # When return_corr is False, plotting always happens regardless of show_plot.
-    if not return_corr or show_plot:
+    if not (return_corr or return_sig) or show_plot:
 
         # Set up the matplotlib figure
         fig, ax_heatmap = plt.subplots(figsize=figsize)
@@ -3358,8 +3369,12 @@ def flex_corr_matrix(
 
         plt.show()
 
+    if return_corr and return_sig:
+        return corr_matrix, pval_matrix
     if return_corr:
         return corr_matrix
+    if return_sig:
+        return pval_matrix
 
 
 ################################################################################

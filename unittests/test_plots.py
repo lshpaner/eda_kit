@@ -973,6 +973,20 @@ def test_flex_corr_matrix_filter_significance_auto_enables_show_significance(
         pytest.fail(f"filter_significance failed to auto-enable significance: {e}")
 
 
+def test_flex_corr_matrix_filter_significance_no_overlay_when_off(
+    sample_corr_dataframe_large,
+):
+    """filter_significance computes p-values for filtering but does NOT force
+    the stars overlay when show_significance=False."""
+    plt.close("all")
+    flex_corr_matrix(
+        sample_corr_dataframe_large,
+        filter_significance=0.05,
+        show_significance=False,
+    )
+    # runs, filters, plots a plain heatmap (no exception is the smoke check)
+
+
 def test_flex_corr_matrix_filter_significance_invalid(sample_corr_dataframe):
     with pytest.raises(ValueError, match="`filter_significance`"):
         flex_corr_matrix(
@@ -2164,3 +2178,41 @@ def test_flex_corr_matrix_show_plot_ignored_without_return_corr(sample_corr_data
     assert result is None
     assert len(plt.get_fignums()) > 0, "Plot should still draw when return_corr=False."
     plt.close("all")
+
+
+def test_flex_corr_matrix_return_sig_true(sample_corr_dataframe_large):
+    """return_sig=True returns the p-value matrix as a square DataFrame."""
+    result = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    assert isinstance(result, pd.DataFrame)
+    assert result.shape[0] == result.shape[1]
+
+
+def test_flex_corr_matrix_return_both_returns_tuple(sample_corr_dataframe_large):
+    """return_corr and return_sig together return (corr, pval)."""
+    corr, pval = flex_corr_matrix(
+        sample_corr_dataframe_large, return_corr=True, return_sig=True
+    )
+    assert isinstance(corr, pd.DataFrame)
+    assert isinstance(pval, pd.DataFrame)
+    assert corr.shape == pval.shape
+
+
+def test_flex_corr_matrix_return_sig_suppresses_plot(sample_corr_dataframe_large):
+    """return_sig=True suppresses the plot by default, like return_corr."""
+    plt.close("all")
+    flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    assert len(plt.get_fignums()) == 0
+
+
+def test_flex_corr_matrix_return_sig_with_show_plot_draws(sample_corr_dataframe_large):
+    """return_sig=True with show_plot=True returns data AND draws."""
+    plt.close("all")
+    flex_corr_matrix(sample_corr_dataframe_large, return_sig=True, show_plot=True)
+    assert len(plt.get_fignums()) > 0
+    plt.close("all")
+
+
+def test_flex_corr_matrix_return_sig_diagonal_is_one(sample_corr_dataframe_large):
+    """The returned p-value matrix carries 1.0 on its diagonal."""
+    pval = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    assert np.allclose(np.diag(pval.values), 1.0)
