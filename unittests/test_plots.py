@@ -959,18 +959,22 @@ def test_flex_corr_matrix_filter_significance_strict(sample_corr_dataframe_large
     )
 
 
-def test_flex_corr_matrix_filter_significance_auto_enables_show_significance(
+def test_flex_corr_matrix_filter_significance_does_not_force_stars(
     sample_corr_dataframe_large,
 ):
-    """filter_significance should auto-enable show_significance without error."""
-    try:
-        flex_corr_matrix(
-            sample_corr_dataframe_large,
-            filter_significance=0.05,
-            show_significance=False,  # should be overridden internally
-        )
-    except Exception as e:
-        pytest.fail(f"filter_significance failed to auto-enable significance: {e}")
+    """`filter_significance` computes p-values in order to filter, but must NOT silently switch the stars overlay on.
+
+    This previously auto-enabled `show_significance`. It no longer does: filtering and displaying are independent.
+    """
+    plt.close("all")
+    flex_corr_matrix(
+        sample_corr_dataframe_large,
+        filter_significance=0.05,
+        show_significance=False,
+    )
+    assert not any(
+        "*" in t for t in _cell_texts()
+    ), "filter_significance is force-enabling the significance overlay again"
 
 
 def test_flex_corr_matrix_filter_significance_no_overlay_when_off(
@@ -2216,3 +2220,483 @@ def test_flex_corr_matrix_return_sig_diagonal_is_one(sample_corr_dataframe_large
     """The returned p-value matrix carries 1.0 on its diagonal."""
     pval = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
     assert np.allclose(np.diag(pval.values), 1.0)
+
+
+# ==================================================================
+# Helpers and fixtures for the significance / sample-size features
+# ==================================================================
+
+
+def _cell_texts():
+    """Collect every annotation on the current figure.
+
+    `flex_corr_matrix` builds its colorbar with `make_axes_locatable`, which appends the colorbar axis AFTER the heatmap axis. `plt.gca()` therefore returns the colorbar, not the heatmap, and `plt.gca().texts` comes back empty. Sweep all axes on the figure instead.
+    """
+    return [t.get_text() for ax in plt.gcf().axes for t in ax.texts]
+
+
+@pytest.fixture
+def sample_missing_dataframe():
+    """Ragged missingness: every column is holed at a different rate, so each pair of columns is backed by a different number of complete rows."""
+    rng = np.random.default_rng(0)
+    n = 400
+    x = rng.normal(size=n)
+    df = pd.DataFrame(
+        {
+            "A": x,
+            "B": x * 0.9 + rng.normal(size=n) * 0.1,
+            "C": rng.normal(size=n),
+            "D": rng.normal(size=n),
+        }
+    )
+    # A stays whole; the rest are punched at 10%, 40% and 75%.
+    for col, rate in [("B", 0.10), ("C", 0.40), ("D", 0.75)]:
+        idx = rng.choice(df.index, size=int(n * rate), replace=False)
+        df.loc[idx, col] = np.nan
+    return df
+
+
+# ==================================================================
+# _stars honors significance_level (regression: the gate was hardcoded
+# at 0.05, so significance_level did nothing in stars mode)
+# ==================================================================
+
+
+def test_flex_corr_matrix_stars_respect_significance_level():
+    """Tightening `significance_level` must remove stars from cells whose p-value falls between the two thresholds."""
+    rng = np.random.default_rng(7)
+    n = 60
+    x = rng.normal(size=n)
+    # A weak-but-real relationship: p lands between 0.001 and 0.05.
+    df = pd.DataFrame({"A": x, "B": 0.32 * x + rng.normal(size=n)})
+
+    pval = flex_corr_matrix(df, return_sig=True).loc["A", "B"]
+    assert 0.001 < pval < 0.05, f"fixture no longer straddles the thresholds (p={pval})"
+
+    plt.close("all")
+    flex_corr_matrix(df, show_significance=True, significance_method="stars")
+    lenient = _cell_texts()
+    assert any("*" in t for t in lenient), "expected a star at the 0.05 default"
+
+    plt.close("all")
+    flex_corr_matrix(
+        df,
+        show_significance=True,
+        significance_method="stars",
+        significance_level=0.001,
+    )
+    strict = _cell_texts()
+    assert not any("*" in t for t in strict), (
+        "significance_level=0.001 should have removed the star; the `_stars` gate is "
+        "ignoring significance_level again"
+    )
+
+
+def test_flex_corr_matrix_stars_default_unchanged(sample_corr_dataframe_large):
+    """The gate fix must not move anything at the 0.05 default."""
+    plt.close("all")
+    flex_corr_matrix(
+        sample_corr_dataframe_large,
+        show_significance=True,
+        significance_method="stars",
+        significance_level=0.05,
+    )
+    assert any("***" in t for t in _cell_texts())
+
+
+def test_flex_corr_matrix_mask_respects_significance_level():
+    """`mask` mode blanks non-significant cells, and `significance_level` controls how many.
+
+    The fixture is built so the A-B p-value lands between the two thresholds; the `sample_corr_dataframe_large` correlations are far too strong for this (p ~ 1e-95), so no threshold short of absurd would move them.
+    """
+    rng = np.random.default_rng(7)
+    n = 60
+    x = rng.normal(size=n)
+    df = pd.DataFrame({"A": x, "B": 0.32 * x + rng.normal(size=n)})
+
+    pval = flex_corr_matrix(df, return_sig=True).loc["A", "B"]
+    assert 0.001 < pval < 0.05, f"fixture no longer straddles the thresholds (p={pval})"
+
+    plt.close("all")
+    flex_corr_matrix(df, show_significance=True, significance_method="mask")
+    lenient_blanks = sum(1 for t in _cell_texts() if t == "")
+
+    plt.close("all")
+    flex_corr_matrix(
+        df,
+        show_significance=True,
+        significance_method="mask",
+        significance_level=0.001,
+    )
+    strict_blanks = sum(1 for t in _cell_texts() if t == "")
+    assert strict_blanks > lenient_blanks
+
+
+# ==================================================================
+# p_adjust
+# ==================================================================
+
+
+def test_flex_corr_matrix_p_adjust_none_is_noop(sample_corr_dataframe_large):
+    """The default must be bit-identical to the pre-p_adjust behavior."""
+    base = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    same = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True, p_adjust=None)
+    pd.testing.assert_frame_equal(base, same)
+
+
+@pytest.mark.parametrize("method", ["bonferroni", "fdr_bh"])
+def test_flex_corr_matrix_p_adjust_only_inflates(sample_corr_dataframe_large, method):
+    """Correction is conservative: no adjusted p-value may fall below its raw value."""
+    raw = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    adj = flex_corr_matrix(
+        sample_corr_dataframe_large, return_sig=True, p_adjust=method
+    )
+    assert (adj.to_numpy() >= raw.to_numpy() - 1e-12).all()
+    assert (adj.to_numpy() <= 1.0).all()
+
+
+def test_flex_corr_matrix_p_adjust_bonferroni_multiplier(sample_corr_dataframe_large):
+    """Bonferroni multiplies by the number of UNIQUE pairs, k*(k-1)/2, not by every off-diagonal cell."""
+    raw = flex_corr_matrix(sample_corr_dataframe_large, return_sig=True)
+    adj = flex_corr_matrix(
+        sample_corr_dataframe_large, return_sig=True, p_adjust="bonferroni"
+    )
+    k = raw.shape[0]
+    m = k * (k - 1) // 2
+
+    # Pick a cell that will not clip at 1.0 after multiplying.
+    iu = np.triu_indices(k, 1)
+    candidates = [(i, j) for i, j in zip(*iu) if raw.to_numpy()[i, j] * m < 0.9]
+    assert candidates, "fixture has no p-value small enough to test the multiplier"
+    i, j = candidates[0]
+    assert np.isclose(adj.to_numpy()[i, j], raw.to_numpy()[i, j] * m)
+
+
+def test_flex_corr_matrix_p_adjust_symmetric_and_diagonal(sample_corr_dataframe_large):
+    adj = flex_corr_matrix(
+        sample_corr_dataframe_large, return_sig=True, p_adjust="fdr_bh"
+    )
+    a = adj.to_numpy()
+    assert np.allclose(a, a.T, equal_nan=True)
+    assert np.allclose(np.diag(a), 1.0)
+
+
+def test_flex_corr_matrix_p_adjust_thins_stars():
+    """A wide matrix of pure noise produces false positives uncorrected; correction removes them."""
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame(rng.normal(size=(60, 12)), columns=[f"v{i}" for i in range(12)])
+    iu = np.triu_indices(12, 1)
+
+    raw = flex_corr_matrix(df, return_sig=True).to_numpy()[iu]
+    bon = flex_corr_matrix(df, return_sig=True, p_adjust="bonferroni").to_numpy()[iu]
+
+    assert (raw < 0.05).sum() > 0, "fixture produced no uncorrected false positives"
+    assert (bon < 0.05).sum() < (raw < 0.05).sum()
+
+
+def test_flex_corr_matrix_p_adjust_feeds_filter_significance():
+    """`filter_significance` must consume the CORRECTED p-values, so correcting can only drop more variables, never fewer."""
+    rng = np.random.default_rng(11)
+    n = 50
+    x = rng.normal(size=n)
+    df = pd.DataFrame(
+        {
+            "A": x,
+            "B": 0.95 * x + rng.normal(size=n) * 0.1,  # survives correction
+            "C": 0.30 * x + rng.normal(size=n),  # marginal: should not
+            "D": rng.normal(size=n),
+            "E": rng.normal(size=n),
+            "F": rng.normal(size=n),
+        }
+    )
+    lenient = flex_corr_matrix(df, return_corr=True, filter_significance=0.05)
+    strict = flex_corr_matrix(
+        df, return_corr=True, filter_significance=0.05, p_adjust="bonferroni"
+    )
+    assert set(strict.columns).issubset(set(lenient.columns))
+    assert len(strict.columns) < len(lenient.columns)
+
+
+def test_flex_corr_matrix_p_adjust_invalid(sample_corr_dataframe):
+    with pytest.raises(ValueError, match="Invalid `p_adjust`"):
+        flex_corr_matrix(sample_corr_dataframe, p_adjust="holm")
+
+
+# ==================================================================
+# return_n
+# ==================================================================
+
+
+def test_flex_corr_matrix_return_n_counts_complete_pairs(sample_missing_dataframe):
+    """Each off-diagonal cell is the number of rows where BOTH members are present."""
+    n_mat = flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    df = sample_missing_dataframe
+    for a in df.columns:
+        for b in df.columns:
+            if a != b:
+                expected = int(df[[a, b]].dropna().shape[0])
+                assert n_mat.loc[a, b] == expected
+
+
+def test_flex_corr_matrix_return_n_diagonal_is_column_nonnull(sample_missing_dataframe):
+    n_mat = flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    for c in sample_missing_dataframe.columns:
+        assert n_mat.loc[c, c] == int(sample_missing_dataframe[c].notna().sum())
+
+
+def test_flex_corr_matrix_return_n_symmetric_and_varies(sample_missing_dataframe):
+    n_mat = flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    assert n_mat.equals(n_mat.T)
+    iu = np.triu_indices(len(n_mat), 1)
+    off = n_mat.to_numpy()[iu]
+    assert (
+        len(set(off.tolist())) > 1
+    ), "ragged missingness must yield differing pairwise n"
+
+
+def test_flex_corr_matrix_return_n_complete_data_is_uniform(
+    sample_corr_dataframe_large,
+):
+    """With no missing values every cell equals the row count."""
+    n_mat = flex_corr_matrix(sample_corr_dataframe_large, return_n=True)
+    assert (n_mat.to_numpy() == len(sample_corr_dataframe_large)).all()
+
+
+def test_flex_corr_matrix_return_n_suppresses_plot(sample_missing_dataframe):
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    assert not plt.get_fignums()
+
+
+def test_flex_corr_matrix_return_n_with_show_plot_draws(sample_missing_dataframe):
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, return_n=True, show_plot=True)
+    assert plt.get_fignums()
+
+
+def test_flex_corr_matrix_return_n_reflects_filter_significance(
+    sample_corr_dataframe_large,
+):
+    """All returned frames must be subset to the same surviving variables."""
+    corr, pval, n_mat = flex_corr_matrix(
+        sample_corr_dataframe_large,
+        return_corr=True,
+        return_sig=True,
+        return_n=True,
+        filter_significance=0.05,
+    )
+    assert list(corr.columns) == list(pval.columns) == list(n_mat.columns)
+
+
+def test_flex_corr_matrix_return_n_reflects_corr_threshold(sample_corr_dataframe_large):
+    corr, n_mat = flex_corr_matrix(
+        sample_corr_dataframe_large,
+        return_corr=True,
+        return_n=True,
+        corr_threshold=0.5,
+    )
+    assert list(corr.columns) == list(n_mat.columns)
+    assert "C" not in n_mat.columns  # the uncorrelated column
+
+
+# ==================================================================
+# Return-tuple contract
+# ==================================================================
+
+
+def test_flex_corr_matrix_return_tuple_is_filtered_not_padded(
+    sample_corr_dataframe_large,
+):
+    """Order is fixed at (corr, pval, n) but unrequested frames are OMITTED, so corr+n comes back as a 2-tuple, not (corr, None, n)."""
+    out = flex_corr_matrix(sample_corr_dataframe_large, return_corr=True, return_n=True)
+    assert isinstance(out, tuple) and len(out) == 2
+    corr, n_mat = out
+    assert (n_mat.to_numpy() == len(sample_corr_dataframe_large)).all()
+    assert np.allclose(np.diag(corr.to_numpy()), 1.0)
+
+
+def test_flex_corr_matrix_return_three_frames(sample_corr_dataframe_large):
+    out = flex_corr_matrix(
+        sample_corr_dataframe_large, return_corr=True, return_sig=True, return_n=True
+    )
+    assert isinstance(out, tuple) and len(out) == 3
+    assert all(isinstance(f, pd.DataFrame) for f in out)
+
+
+def test_flex_corr_matrix_single_return_unwraps(sample_corr_dataframe_large):
+    assert isinstance(
+        flex_corr_matrix(sample_corr_dataframe_large, return_n=True), pd.DataFrame
+    )
+
+
+# ==================================================================
+# n_format
+# ==================================================================
+
+
+def test_flex_corr_matrix_n_format_percent_without_filter(sample_missing_dataframe):
+    """Regression: the percent conversion was once nested inside the `filter_significance` block, so it silently returned counts when no filter was set."""
+    counts = flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    pct = flex_corr_matrix(sample_missing_dataframe, return_n=True, n_format="percent")
+    total = len(sample_missing_dataframe)
+    assert pct.to_numpy().max() <= 100.0
+    assert np.allclose(pct.to_numpy(), 100.0 * counts.to_numpy() / total)
+
+
+def test_flex_corr_matrix_n_format_percent_diagonal_is_completeness(
+    sample_missing_dataframe,
+):
+    """A column present in every row reads 100.0."""
+    pct = flex_corr_matrix(sample_missing_dataframe, return_n=True, n_format="percent")
+    assert np.isclose(pct.loc["A", "A"], 100.0)
+    assert pct.loc["D", "D"] < 30.0  # D is holed at 75%
+
+
+def test_flex_corr_matrix_n_format_percent_denominator_survives_filtering(
+    sample_corr_dataframe_large,
+):
+    """Filtering drops columns, never rows, so the denominator stays the full row count and percentages remain comparable across filtered and unfiltered calls."""
+    unfiltered = flex_corr_matrix(
+        sample_corr_dataframe_large, return_n=True, n_format="percent"
+    )
+    filtered = flex_corr_matrix(
+        sample_corr_dataframe_large,
+        return_n=True,
+        n_format="percent",
+        corr_threshold=0.5,
+    )
+    shared = [c for c in filtered.columns]
+    assert np.allclose(
+        filtered.loc[shared, shared].to_numpy(),
+        unfiltered.loc[shared, shared].to_numpy(),
+    )
+
+
+def test_flex_corr_matrix_n_format_default_is_count(sample_missing_dataframe):
+    a = flex_corr_matrix(sample_missing_dataframe, return_n=True)
+    b = flex_corr_matrix(sample_missing_dataframe, return_n=True, n_format="count")
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_flex_corr_matrix_n_format_invalid(sample_corr_dataframe):
+    with pytest.raises(ValueError, match="Invalid `n_format`"):
+        flex_corr_matrix(sample_corr_dataframe, return_n=True, n_format="pct")
+
+
+# ==================================================================
+# show_n (mode switch, not an overlay)
+# ==================================================================
+
+
+def test_flex_corr_matrix_show_n_plots_counts_not_correlations(
+    sample_missing_dataframe,
+):
+    """`show_n` replaces the plotted quantity. The cells must carry sample sizes and NOT correlation coefficients."""
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, triangular=False)
+    texts = _cell_texts()
+    assert texts
+    # Counts are thousands-grouped integers; correlations look like "0.42" / "-0.31".
+    assert not any(
+        "." in t for t in texts
+    ), f"correlation coefficients leaked in: {texts}"
+    expected = int(sample_missing_dataframe[["A", "B"]].dropna().shape[0])
+    assert f"{expected:,}" in texts
+
+
+def test_flex_corr_matrix_show_n_percent_labels(sample_missing_dataframe):
+    plt.close("all")
+    flex_corr_matrix(
+        sample_missing_dataframe, show_n=True, n_format="percent", triangular=False
+    )
+    texts = _cell_texts()
+    assert texts and all(t.endswith("%") for t in texts)
+    assert "100.0%" in texts  # column A is complete
+
+
+def test_flex_corr_matrix_show_n_uses_sample_size_scale(sample_missing_dataframe):
+    """The color scale and colorbar must switch to the count axis, not stay on [-1, 1] / "Correlation Index"."""
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, n_format="percent")
+    fig = plt.gcf()
+    lo, hi = fig.axes[0].collections[0].get_clim()
+    assert (lo, hi) == (0.0, 100.0)
+    assert "Correlation Index" not in fig.axes[1].get_ylabel()
+
+
+def test_flex_corr_matrix_show_n_cmap_default_is_sequential(sample_missing_dataframe):
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True)
+    assert plt.gcf().axes[0].collections[0].cmap.name == "viridis"
+
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe)
+    assert plt.gcf().axes[0].collections[0].cmap.name == "coolwarm"
+
+
+def test_flex_corr_matrix_show_n_cmap_override(sample_missing_dataframe):
+    """One `cmap` parameter serves both modes."""
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, cmap="magma")
+    assert plt.gcf().axes[0].collections[0].cmap.name == "magma"
+
+
+def test_flex_corr_matrix_show_n_does_not_suppress_plot(sample_missing_dataframe):
+    """`show_n` is a display flag, not a return flag."""
+    plt.close("all")
+    assert flex_corr_matrix(sample_missing_dataframe, show_n=True) is None
+    assert plt.get_fignums()
+
+
+def test_flex_corr_matrix_show_n_with_return_n(sample_missing_dataframe):
+    """Plots the figure AND hands back the frame."""
+    plt.close("all")
+    out = flex_corr_matrix(
+        sample_missing_dataframe, show_n=True, return_n=True, show_plot=True
+    )
+    assert isinstance(out, pd.DataFrame)
+    assert plt.get_fignums()
+
+
+def test_flex_corr_matrix_show_n_honors_triangular(sample_missing_dataframe):
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, triangular=True)
+    tri = len(_cell_texts())
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, triangular=False)
+    full = len(_cell_texts())
+    assert tri < full
+
+
+def test_flex_corr_matrix_show_n_rejects_show_significance(sample_corr_dataframe_large):
+    """The two modes draw different quantities and cannot share a figure."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        flex_corr_matrix(
+            sample_corr_dataframe_large, show_n=True, show_significance=True
+        )
+
+
+def test_flex_corr_matrix_show_n_colors_the_sample_sizes(sample_missing_dataframe):
+    """The QuadMesh must be built from the n matrix, not the correlation matrix.
+
+    Checking the cell labels is not enough: the annotations are drawn from `n_matrix` regardless, so a bug that leaves the *colors* on the correlation matrix produces a figure with sample-size labels painted by correlation values, and every label-based assertion still passes. Read the mesh data itself.
+    """
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, show_n=True, triangular=False)
+    mesh = plt.gcf().axes[0].collections[0].get_array()
+    plotted = np.ma.compressed(np.asarray(mesh))
+
+    expected = flex_corr_matrix(sample_missing_dataframe, return_n=True).to_numpy()
+    assert np.allclose(np.sort(plotted), np.sort(expected.ravel()))
+    # Correlations live on [-1, 1]; sample sizes are row counts.
+    assert plotted.max() > 1.0
+
+
+def test_flex_corr_matrix_default_colors_the_correlations(sample_missing_dataframe):
+    """The converse: without show_n the mesh must carry the correlations."""
+    plt.close("all")
+    flex_corr_matrix(sample_missing_dataframe, triangular=False)
+    plotted = np.ma.compressed(np.asarray(plt.gcf().axes[0].collections[0].get_array()))
+    expected = flex_corr_matrix(sample_missing_dataframe, return_corr=True).to_numpy()
+    assert np.allclose(np.sort(plotted), np.sort(expected.ravel()))
+    assert plotted.max() <= 1.0 + 1e-9

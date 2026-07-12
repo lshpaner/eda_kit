@@ -39,6 +39,7 @@ from ._plot_utils import (
     _qq_plot,
     _cdf_exceedance_plot,
     _get_palette,
+    _adjust_pvalues,
 )
 
 ################################################################################
@@ -2759,7 +2760,7 @@ def flex_corr_matrix(
     df: pd.DataFrame,
     cols: Optional[List[str]] = None,
     annot: bool = True,
-    cmap: str = "coolwarm",
+    cmap: Optional[str] = None,
     save_plots: bool = False,
     image_path_png: Optional[str] = None,
     image_path_svg: Optional[str] = None,
@@ -2773,9 +2774,9 @@ def flex_corr_matrix(
     xlabel_alignment: str = "right",
     ylabel_alignment: str = "center_baseline",
     text_wrap: int = 50,
-    vmin: float = -1,
-    vmax: float = 1,
-    cbar_label: str = "Correlation Index",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cbar_label: Optional[str] = None,
     triangular: bool = True,
     label_names: Optional[Dict[str, str]] = None,
     cbar_padding: float = 0.8,
@@ -2786,13 +2787,17 @@ def flex_corr_matrix(
     significance_level: float = 0.05,
     significance_method: str = "stars",
     significance_legend_x: float = 0.5,
+    p_adjust: Optional[str] = None,
     filter_significance: Optional[float] = None,
     corr_threshold: Optional[float] = None,
     return_corr: bool = False,
     return_sig: bool = False,
+    show_n: bool = False,
+    return_n: bool = False,
+    n_format: str = "count",
     show_plot: bool = False,
     **kwargs: Dict[str, Any],
-) -> Optional[Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]]:
+) -> Optional[Union[pd.DataFrame, Tuple[pd.DataFrame, ...]]]:
     """
     Creates a correlation heatmap with extensive customization options, including
     triangular masking, alignment adjustments, title wrapping, dynamic colorbar
@@ -2811,8 +2816,12 @@ def flex_corr_matrix(
     annot : bool, optional (default=True)
         Whether to annotate the heatmap with correlation coefficients.
 
-    cmap : str, optional (default='coolwarm')
-        The colormap to use for the heatmap.
+    cmap : str or None, optional (default=None)
+        The colormap to use for the heatmap. When None, resolves by mode:
+        "coolwarm" for the correlation heatmap (diverging, since correlations are
+        signed and centered on zero) and "viridis" for the `show_n` heatmap
+        (sequential, since sample sizes run from zero upward with no midpoint).
+        Pass a name to override in either mode.
 
     save_plots : bool, optional (default=False)
         Whether to save the heatmap as an image. When True, the plot is saved
@@ -2861,14 +2870,19 @@ def flex_corr_matrix(
         title, x-axis labels, and y-axis labels, ensuring that long text is
         neatly displayed without overflow or truncation.
 
-    vmin : float, optional (default=-1)
-        Minimum value for the heatmap color scale.
+    vmin : float or None, optional (default=None)
+        Minimum value for the heatmap color scale. When None, resolves by mode: -1
+        for the correlation heatmap, 0 for the `show_n` heatmap.
 
-    vmax : float, optional (default=1)
-        Maximum value for the heatmap color scale.
+    vmax : float or None, optional (default=None)
+        Maximum value for the heatmap color scale. When None, resolves by mode: 1
+        for the correlation heatmap; for the `show_n` heatmap, 100 under
+        `n_format="percent"` and the largest observed count otherwise.
 
-    cbar_label : str, optional (default='Correlation Index')
-        Label for the colorbar.
+    cbar_label : str or None, optional (default=None)
+        Label for the colorbar. When None, resolves by mode: "Correlation Index"
+        for the correlation heatmap, and a sample-size label derived from
+        `n_format` for the `show_n` heatmap.
 
     triangular : bool, optional (default=True)
         Whether to show only the upper triangle of the correlation matrix.
@@ -2915,6 +2929,23 @@ def flex_corr_matrix(
         rendered axes bounding box so it always sits just below the x-axis
         labels regardless of figure size.
 
+    p_adjust : str or None, optional (default=None)
+        Multiple-comparison correction applied to the pairwise p-values before
+        anything consumes them. Options are:
+        - None: no correction. P-values are reported as computed.
+        - "bonferroni": controls the family-wise error rate. Each p-value is
+          multiplied by the number of tests and clipped at 1.0. Conservative.
+        - "fdr_bh": Benjamini-Hochberg step-up procedure. Controls the false
+          discovery rate. Less conservative than Bonferroni and usually the
+          better choice on a wide matrix.
+        A correlation matrix over k variables runs k * (k - 1) / 2 unique
+        pairwise tests, so on even a modest matrix the uncorrected stars
+        overstate significance. The correction is computed over unique pairs,
+        not over every off-diagonal cell, so each pair is counted once. Pairs
+        with too few complete observations to test are excluded from the test
+        count. The correction runs before `filter_significance`, the stars/mask
+        overlay, and `return_sig`, so all of them see adjusted values.
+
     filter_significance : float or None, optional (default=None)
         If provided, filters the correlation matrix to only include variables
         that have at least one statistically significant correlation with
@@ -2942,19 +2973,58 @@ def flex_corr_matrix(
 
     return_sig : bool, optional (default=False)
         If True, returns the pairwise p-value matrix (computed with
-        `corr_method`, after any `filter_significance` filtering) as a
-        DataFrame. The diagonal holds the initialized placeholder value of 1.
-        Like `return_corr`, this suppresses the heatmap by default; pass
-        `show_plot=True` to render it as well. If both `return_corr` and
-        `return_sig` are True, a tuple `(corr_matrix, pval_matrix)` is
-        returned.
+        `corr_method`, corrected by `p_adjust` if set, and subset to the same
+        variables as the plotted matrix after any filtering) as a DataFrame.
+        The diagonal holds the initialized placeholder value of 1. Like
+        `return_corr`, this suppresses the heatmap by default; pass
+        `show_plot=True` to render it as well.
+
+    show_n : bool, optional (default=False)
+        If True, the heatmap plots the pairwise sample sizes instead of the
+        correlation coefficients. This is a mode switch, not an overlay: the cells
+        are colored by n, labeled with n, and scaled on a count axis rather than the
+        correlation axis. `cmap`, `vmin`, `vmax`, and `cbar_label` all pick up
+        sample-size-appropriate defaults automatically in this mode, and can still
+        be overridden. The result is a coverage map, showing at a glance which pairs
+        rest on most of the data and which rest on a sliver of it, and revealing the
+        structure of the missingness itself. Honors `n_format` and `triangular`.
+        Mutually exclusive with `show_significance`, since there are no coefficients
+        to attach stars to; draw the correlation figure separately.
+
+    return_n : bool, optional (default=False)
+        If True, returns the pairwise sample-size matrix as a DataFrame with the
+        same shape, index, columns, and symmetry as the correlation matrix. Each
+        off-diagonal cell holds the number of rows in which *both* variables in
+        that pair are present, which is the number of observations that actually
+        went into that cell's correlation coefficient. Because correlations are
+        computed pairwise-complete (missing values are dropped per pair, not
+        listwise across the whole frame), this count differs from cell to cell,
+        and a strong coefficient backed by a handful of rows is indistinguishable
+        from one backed by thousands when looking at the heatmap alone. The
+        diagonal holds each variable's own non-null count. Like `return_corr`,
+        this suppresses the heatmap by default; pass `show_plot=True` to render
+        it as well.
+
+    n_format : str, optional (default="count")
+        Units for the sample sizes, applied to both the matrix returned by
+        `return_n` and the heatmap drawn by `show_n`. Ignored when neither is set.
+        Options are:
+        - "count": raw row counts as integers.
+        - "percent": each count divided by the total number of rows in the frame
+          and multiplied by 100, returned as floats. Column filtering
+          (`corr_threshold`, `filter_significance`) drops variables but never
+          rows, so the denominator is always the full row count and the values
+          stay comparable across filtered and unfiltered calls. Values are not
+          rounded; round them yourself if you want a tidier display. Under this
+          setting the diagonal reads as each variable's completeness, so a
+          variable present in every row shows 100.0.
 
     show_plot : bool, optional (default=False)
-        Only has an effect when `return_corr=True` or `return_sig=True`. By
-        default, requesting a returned frame suppresses the heatmap and returns
-        the data only; set `show_plot=True` to also render the plot. When
-        neither return flag is set the heatmap always displays and this flag is
-        ignored.
+        Only has an effect when `return_corr=True`, `return_sig=True`, or
+        `return_n=True`. By default, requesting a returned frame suppresses the
+        heatmap and returns the data only; set `show_plot=True` to also render
+        the plot. When no return flag is set the heatmap always displays and
+        this flag is ignored.
 
     **kwargs : dict, optional
         Additional keyword arguments to pass to `sns.heatmap()`.
@@ -2962,11 +3032,14 @@ def flex_corr_matrix(
     Returns:
     --------
     pandas.DataFrame, tuple of pandas.DataFrame, or None
-        - If `return_corr=True` only: the (possibly filtered) correlation
-          matrix.
-        - If `return_sig=True` only: the (possibly filtered) p-value matrix.
-        - If both are True: a tuple `(corr_matrix, pval_matrix)`.
-        - If neither is set: None (the heatmap is plotted).
+        - If exactly one of `return_corr`, `return_sig`, or `return_n` is True:
+          that single DataFrame.
+        - If more than one is True: a tuple containing the requested frames in
+          the fixed order `(corr_matrix, pval_matrix, n_matrix)`, with the
+          unrequested frames omitted rather than padded with None. Requesting
+          `return_corr` and `return_n` therefore yields a two-element tuple
+          `(corr_matrix, n_matrix)`.
+        - If none are set: None (the heatmap is plotted).
 
     Raises:
     -------
@@ -2984,6 +3057,12 @@ def flex_corr_matrix(
         If `corr_method` is not one of "pearson", "spearman", or "kendall".
     ValueError
         If `significance_method` is not one of "stars" or "mask".
+    ValueError
+        If `p_adjust` is not None, "bonferroni", or "fdr_bh".
+    ValueError
+        If `n_format` is not one of "count" or "percent".
+    ValueError
+        If `show_n` and `show_significance` are both True.
     ValueError
         If `filter_significance` is not None and is not a positive float.
     ValueError
@@ -3012,6 +3091,22 @@ def flex_corr_matrix(
     - The p-value matrix returned by `return_sig=True` carries the initialized
       value of 1 on its diagonal, since a variable has no p-value against
       itself.
+    - Correlations are computed pairwise-complete: for each pair of variables,
+      rows missing either member of the pair are dropped, and the remaining rows
+      are used. Rows missing some *third* variable are not dropped. Every cell in
+      the matrix can therefore rest on a different number of observations. Set
+      `return_n=True` to see those counts.
+    - When `p_adjust` is combined with `corr_threshold`, the correction is
+      computed only over the variables that survived the threshold, since
+      p-values are not computed for variables that were already dropped. The test
+      count reflects the tests that were actually run on the reduced matrix.
+    - `p_adjust` does not change the star tiers themselves. The tiers remain
+      p < 0.05, p < 0.01, p < 0.001 by convention; they are simply evaluated
+      against corrected p-values, so fewer cells earn stars.
+    - `show_n` and `show_significance` draw different quantities and cannot share a
+      figure. The correlation heatmap answers how strong a relationship is; the
+      `show_n` heatmap answers how much data stands behind it. Call the function
+      twice to get both.
     """
 
     # Validation: Ensure annot is a boolean
@@ -3048,6 +3143,31 @@ def flex_corr_matrix(
         raise ValueError(
             f"Invalid `significance_method` '{significance_method}'. "
             f"Choose from {valid_sig_methods}."
+        )
+
+    # show_n replaces the plotted quantity, so a significance overlay computed from
+    # the correlations has nothing to annotate. Fail loudly instead of silently
+    # dropping one of them.
+    if show_n and show_significance:
+        raise ValueError(
+            "`show_n` and `show_significance` are mutually exclusive. `show_n` plots "
+            "the pairwise sample sizes, not the correlations, so significance stars "
+            "have nothing to attach to. Draw two separate figures."
+        )
+
+    # Validate n_format
+    valid_n_formats = ["count", "percent"]
+    if n_format not in valid_n_formats:
+        raise ValueError(
+            f"Invalid `n_format` '{n_format}'. Choose from {valid_n_formats}."
+        )
+
+    # Validate p_adjust
+    valid_p_adjust = ["bonferroni", "fdr_bh"]
+    if p_adjust is not None and p_adjust not in valid_p_adjust:
+        raise ValueError(
+            f"Invalid `p_adjust` '{p_adjust}'. "
+            f"Choose from {valid_p_adjust} or None."
         )
 
     # Validate filter_significance
@@ -3112,31 +3232,64 @@ def flex_corr_matrix(
     # Compute p-values when any consumer needs them: the stars/mask display,
     # the variable filter, or the (optional) p-value return.
     _need_pvalues = show_significance or filter_significance is not None or return_sig
-    if _need_pvalues:
+
+    # The pairwise sweep is shared. Both the p-values and the sample sizes fall
+    # out of the same per-pair dropna, so walk the pairs once and fill whichever
+    # matrices were actually asked for.
+    _need_pairwise = _need_pvalues or return_n or show_n
+
+    if _need_pairwise:
         from scipy import stats as _stats
 
         n_cols = len(df_numeric.columns)
-        pval_matrix = pd.DataFrame(
-            np.ones((n_cols, n_cols)),
-            index=df_numeric.columns,
-            columns=df_numeric.columns,
-        )
 
-        _stat_func = {
-            "pearson": _stats.pearsonr,
-            "spearman": _stats.spearmanr,
-            "kendall": _stats.kendalltau,
-        }[corr_method]
+        if _need_pvalues:
+            pval_matrix = pd.DataFrame(
+                np.ones((n_cols, n_cols)),
+                index=df_numeric.columns,
+                columns=df_numeric.columns,
+            )
+
+            _stat_func = {
+                "pearson": _stats.pearsonr,
+                "spearman": _stats.spearmanr,
+                "kendall": _stats.kendalltau,
+            }[corr_method]
+
+        # The sample-size matrix is needed for the return value, the plot, or both.
+        _need_n = return_n or show_n
+
+        if _need_n:
+            # Diagonal seeds with each variable's own non-null count, which is what
+            # pairing a column with itself and dropping NaN would yield anyway.
+            n_matrix = pd.DataFrame(
+                np.diag([int(df_numeric[c].notna().sum()) for c in df_numeric.columns]),
+                index=df_numeric.columns,
+                columns=df_numeric.columns,
+            )
 
         for i, col_i in enumerate(df_numeric.columns):
             for j, col_j in enumerate(df_numeric.columns):
                 if i != j:
+                    # Pairwise-complete: only rows where both members survive.
                     valid = df_numeric[[col_i, col_j]].dropna()
-                    if len(valid) >= 3:
-                        _, p = _stat_func(valid[col_i], valid[col_j])
-                        pval_matrix.loc[col_i, col_j] = p
-                    else:
-                        pval_matrix.loc[col_i, col_j] = np.nan
+                    n_valid = len(valid)
+
+                    if _need_n:
+                        n_matrix.loc[col_i, col_j] = n_valid
+
+                    if _need_pvalues:
+                        if n_valid >= 3:
+                            _, p = _stat_func(valid[col_i], valid[col_j])
+                            pval_matrix.loc[col_i, col_j] = p
+                        else:
+                            pval_matrix.loc[col_i, col_j] = np.nan
+
+        # Correct for multiple comparisons before anything reads the p-values, so
+        # the stars, the mask, the variable filter, and the returned frame all
+        # agree on what "significant" means.
+        if _need_pvalues and p_adjust is not None:
+            pval_matrix = _adjust_pvalues(pval_matrix, p_adjust)
 
         # Filter variables that have no significant correlations
         if filter_significance is not None:
@@ -3150,7 +3303,17 @@ def flex_corr_matrix(
                             break
             df_numeric = df_numeric[cols_to_keep]
             corr_matrix = df_numeric.corr(method=corr_method)
+            # Re-apply the -0.00 zeroing the recomputed matrix would otherwise lose.
+            corr_matrix = corr_matrix.where(corr_matrix.abs() >= 0.005, 0.0)
             pval_matrix = pval_matrix.loc[cols_to_keep, cols_to_keep]
+            if _need_n:
+                n_matrix = n_matrix.loc[cols_to_keep, cols_to_keep]
+
+        # Express the counts as a share of the frame. Filtering drops columns,
+        # never rows, so the denominator is the full row count regardless of
+        # what survived.
+        if _need_n and n_format == "percent":
+            n_matrix = 100.0 * n_matrix / len(df_numeric)
 
         def _stars(p):
             if pd.isna(p) or p >= significance_level:
@@ -3162,13 +3325,47 @@ def flex_corr_matrix(
             else:
                 return "*"
 
+    # show_n swaps the plotted quantity, and the two quantities want different scales.
+    # Correlations are signed, live on [-1, 1], and have a meaningful midpoint at zero,
+    # so they want a diverging colormap. Sample sizes run from zero upward with no
+    # midpoint, so they want a sequential one. Rather than carry a parallel set of
+    # n-specific parameters, `cmap`, `vmin`, `vmax`, and `cbar_label` default to None
+    # and resolve to whichever is right for the active mode. Passing any of them
+    # explicitly overrides the default in either mode.
+    if show_n:
+        plot_matrix = n_matrix
+        plot_cmap = cmap if cmap is not None else "viridis"
+        plot_vmin = vmin if vmin is not None else 0
+        plot_vmax = (
+            vmax
+            if vmax is not None
+            else (100.0 if n_format == "percent" else float(n_matrix.to_numpy().max()))
+        )
+        plot_cbar_label = cbar_label or (
+            "% of rows behind each correlation"
+            if n_format == "percent"
+            else "Rows behind each correlation"
+        )
+    else:
+        plot_matrix = corr_matrix
+        plot_cmap = cmap if cmap is not None else "coolwarm"
+        plot_vmin = vmin if vmin is not None else -1
+        plot_vmax = vmax if vmax is not None else 1
+        plot_cbar_label = cbar_label or "Correlation Index"
+
     # Generate a mask for the upper triangle, excluding the diagonal
     mask = None
     if triangular:
-        mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+        mask = np.triu(np.ones_like(plot_matrix, dtype=bool), k=1)
 
     # Build annotation matrix
-    if annot and show_significance:
+    if annot and show_n:
+        annot_data = n_matrix.map(
+            lambda v: f"{v:.1f}%" if n_format == "percent" else f"{int(v):,}"
+        )
+        annot_arg = annot_data
+        fmt_arg = ""
+    elif annot and show_significance:
         if significance_method == "stars":
             # Combine r value with significance stars
             annot_data = corr_matrix.copy().astype(object)
@@ -3205,25 +3402,25 @@ def flex_corr_matrix(
         annot_arg = annot
         fmt_arg = ".2f"
 
-    # Plot unless the caller is pulling the dataframe and opted out.
-    # When return_corr is False, plotting always happens regardless of show_plot.
-    if not (return_corr or return_sig) or show_plot:
+    # Plot unless the caller is pulling a dataframe and opted out.
+    # When no return flag is set, plotting always happens regardless of show_plot.
+    if not (return_corr or return_sig or return_n) or show_plot:
 
         # Set up the matplotlib figure
         fig, ax_heatmap = plt.subplots(figsize=figsize)
 
         # Draw the heatmap
         heatmap = sns.heatmap(
-            corr_matrix,
+            plot_matrix,
             mask=mask,
-            cmap=cmap,
+            cmap=plot_cmap,
             annot=annot_arg,
             fmt=fmt_arg,
             square=True,
             linewidths=0.5,
             cbar=False,
-            vmin=vmin,
-            vmax=vmax,
+            vmin=plot_vmin,
+            vmax=plot_vmax,
             annot_kws={"fontsize": label_fontsize},
             ax=ax_heatmap,
             **kwargs,
@@ -3243,7 +3440,7 @@ def flex_corr_matrix(
             )
 
             cbar.ax.tick_params(labelsize=tick_fontsize)
-            cbar.set_label(cbar_label, fontsize=label_fontsize)
+            cbar.set_label(plot_cbar_label, fontsize=label_fontsize)
 
             pos_heatmap = ax_heatmap.get_position()
             pos_cax = cax.get_position()
@@ -3369,12 +3566,20 @@ def flex_corr_matrix(
 
         plt.show()
 
-    if return_corr and return_sig:
-        return corr_matrix, pval_matrix
+    # Fixed order: (corr, pval, n). Unrequested frames are omitted, not padded,
+    # so a single request unwraps to a bare DataFrame.
+    requested = []
     if return_corr:
-        return corr_matrix
+        requested.append(corr_matrix)
     if return_sig:
-        return pval_matrix
+        requested.append(pval_matrix)
+    if return_n:
+        requested.append(n_matrix)
+
+    if len(requested) == 1:
+        return requested[0]
+    if requested:
+        return tuple(requested)
 
 
 ################################################################################
