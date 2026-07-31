@@ -19,6 +19,7 @@ from eda_toolkit._plot_utils import (
     _fit_distribution,
     _qq_plot,
     _cdf_exceedance_plot,
+    _adjust_pvalues,
 )
 
 
@@ -398,3 +399,131 @@ def test_cdf_exceedance_both(fig_ax):
         tail="both",
         label_fontsize=10,
     )
+
+
+# ---------------------------------------------------------------------------
+# _adjust_pvalues: multiple-comparison correction
+# ---------------------------------------------------------------------------
+
+
+def _symmetric_pvals(k, seed=0):
+    """A symmetric matrix of pairwise p-values with 1.0 on the diagonal.
+
+    Drawn log-uniformly over [1e-6, 1] rather than uniformly, so the matrix contains p-values small enough to survive a Bonferroni multiplier without clipping at 1.0. A flat uniform draw is almost all large values and cannot exercise the multiplier.
+    """
+    rng = np.random.default_rng(seed)
+    P = 10.0 ** rng.uniform(-6, 0, size=(k, k))
+    P = (P + P.T) / 2
+    np.fill_diagonal(P, 1.0)
+    labels = [f"v{i}" for i in range(k)]
+    return pd.DataFrame(P, index=labels, columns=labels)
+
+
+def _bh_reference(p):
+    """Benjamini-Hochberg, written independently of the implementation under test."""
+    p = np.asarray(p, dtype=float)
+    m = len(p)
+    order = np.argsort(p)
+    out = np.empty(m)
+    running = 1.0
+    # Walk from the largest p downward, enforcing monotonicity as we go.
+    for rank in range(m, 0, -1):
+        idx = order[rank - 1]
+        running = min(running, p[idx] * m / rank)
+        out[idx] = min(running, 1.0)
+    return out
+
+
+def test_adjust_pvalues_bonferroni_counts_unique_pairs():
+    """m is k*(k-1)/2, not k*(k-1). Correcting every off-diagonal cell would count each pair twice and over-penalize by a factor of two."""
+    k = 6
+    pm = _symmetric_pvals(k)
+    adj = _adjust_pvalues(pm, "bonferroni")
+
+    iu = np.triu_indices(k, 1)
+    raw = pm.to_numpy()[iu]
+    m = k * (k - 1) // 2
+
+    small = raw < (0.9 / m)  # cells that will not clip at 1.0
+    assert small.any()
+    assert np.allclose(adj.to_numpy()[iu][small], raw[small] * m)
+
+
+def test_adjust_pvalues_fdr_bh_matches_reference():
+    k = 8
+    pm = _symmetric_pvals(k, seed=5)
+    adj = _adjust_pvalues(pm, "fdr_bh")
+    iu = np.triu_indices(k, 1)
+    assert np.allclose(adj.to_numpy()[iu], _bh_reference(pm.to_numpy()[iu]))
+
+
+def test_adjust_pvalues_fdr_bh_is_monotone():
+    """The step-up procedure must preserve the ordering of the raw p-values."""
+    pm = _symmetric_pvals(7, seed=2)
+    adj = _adjust_pvalues(pm, "fdr_bh")
+    iu = np.triu_indices(7, 1)
+    raw, out = pm.to_numpy()[iu], adj.to_numpy()[iu]
+    order = np.argsort(raw)
+    assert np.all(np.diff(out[order]) >= -1e-12)
+
+
+@pytest.mark.parametrize("method", ["bonferroni", "fdr_bh"])
+def test_adjust_pvalues_never_shrinks_and_clips_at_one(method):
+    pm = _symmetric_pvals(6, seed=9)
+    adj = _adjust_pvalues(pm, method).to_numpy()
+    assert (adj >= pm.to_numpy() - 1e-12).all()
+    assert (adj <= 1.0).all()
+
+
+@pytest.mark.parametrize("method", ["bonferroni", "fdr_bh"])
+def test_adjust_pvalues_symmetric_with_untouched_diagonal(method):
+    pm = _symmetric_pvals(5, seed=4)
+    adj = _adjust_pvalues(pm, method).to_numpy()
+    assert np.allclose(adj, adj.T, equal_nan=True)
+    assert np.allclose(np.diag(adj), 1.0)
+
+
+def test_adjust_pvalues_nan_pairs_excluded_from_test_count():
+    """A pair with too few complete observations never ran a test, so it must not inflate m, and it must stay NaN."""
+    k = 4
+    pm = _symmetric_pvals(k, seed=1)
+    pm.iloc[0, 2] = np.nan
+    pm.iloc[2, 0] = np.nan
+
+    adj = _adjust_pvalues(pm, "bonferroni")
+    assert np.isnan(adj.iloc[0, 2]) and np.isnan(adj.iloc[2, 0])
+
+    # 6 unique pairs, one untestable, so the multiplier must be 5 and not 6.
+    testable = [
+        (i, j)
+        for i, j in zip(*np.triu_indices(k, 1))
+        if not np.isnan(pm.to_numpy()[i, j])
+    ]
+    m = len(testable)
+    assert m == 5
+    i, j = min(testable, key=lambda ij: pm.to_numpy()[ij])
+    assert np.isclose(adj.to_numpy()[i, j], pm.to_numpy()[i, j] * m)
+
+
+def test_adjust_pvalues_all_nan_does_not_blow_up():
+    """m == 0 must return cleanly rather than dividing by zero."""
+    pm = pd.DataFrame(
+        [[1.0, np.nan], [np.nan, 1.0]], index=["a", "b"], columns=["a", "b"]
+    )
+    adj = _adjust_pvalues(pm, "fdr_bh")
+    assert np.isnan(adj.loc["a", "b"])
+    assert np.allclose(np.diag(adj.to_numpy()), 1.0)
+
+
+def test_adjust_pvalues_preserves_labels():
+    pm = _symmetric_pvals(4)
+    adj = _adjust_pvalues(pm, "fdr_bh")
+    assert list(adj.index) == list(pm.index)
+    assert list(adj.columns) == list(pm.columns)
+
+
+def test_adjust_pvalues_does_not_mutate_input():
+    pm = _symmetric_pvals(5, seed=8)
+    before = pm.copy()
+    _adjust_pvalues(pm, "bonferroni")
+    pd.testing.assert_frame_equal(pm, before)

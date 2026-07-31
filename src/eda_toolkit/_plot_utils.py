@@ -519,3 +519,74 @@ def _cdf_exceedance_plot(
     # Set axis labels with explicit font size
     ax.set_xlabel("x", fontsize=label_fontsize)
     ax.set_ylabel(ylabel, fontsize=label_fontsize)
+
+
+################################################################################
+# Multiple-Comparison Correction Utility
+################################################################################
+
+
+def _adjust_pvalues(pval_matrix, method):
+    """
+    Apply a multiple-comparison correction to a symmetric matrix of pairwise
+    p-values.
+
+    The correction is computed over the set of *unique* pairs
+    (the strict upper triangle), so the number of tests is
+    k * (k - 1) / 2 rather than k * (k - 1). Correcting every off-diagonal cell
+    independently would count each pair twice and over-penalize by a factor of two.
+    Adjusted values are written back symmetrically. NaN cells (pairs with too few
+    complete observations to test) are excluded from the test count and left as
+    NaN. The diagonal is untouched.
+
+    Parameters:
+    -----------
+    pval_matrix : pandas.DataFrame
+        Square, symmetric matrix of raw pairwise p-values.
+
+    method : str
+        Correction to apply. Either "bonferroni" (multiply each p-value by the
+        number of tests) or "fdr_bh" (Benjamini-Hochberg step-up procedure
+        controlling the false discovery rate).
+
+    Returns:
+    --------
+    pandas.DataFrame
+        A new matrix of adjusted p-values with the same index, columns, and
+        symmetry as the input. Values are clipped to a maximum of 1.0.
+    """
+    adjusted = pval_matrix.copy()
+    k = len(pval_matrix)
+
+    # Collect the unique pairs from the strict upper triangle.
+    iu = np.triu_indices(k, k=1)
+    raw = pval_matrix.to_numpy()[iu]
+
+    # Only testable pairs count toward the correction; NaN pairs never ran a test.
+    testable = ~np.isnan(raw)
+    m = int(testable.sum())
+    if m == 0:
+        return adjusted
+
+    p = raw[testable]
+
+    if method == "bonferroni":
+        p_adj = np.minimum(p * m, 1.0)
+    else:  # fdr_bh
+        order = np.argsort(p)
+        ranked = p[order]
+        # Step-up: scale by m / rank, then enforce monotonicity from the largest down.
+        scaled = ranked * m / np.arange(1, m + 1)
+        scaled = np.minimum.accumulate(scaled[::-1])[::-1]
+        p_adj = np.empty(m, dtype=float)
+        p_adj[order] = np.minimum(scaled, 1.0)
+
+    out = np.full(raw.shape, np.nan, dtype=float)
+    out[testable] = p_adj
+
+    values = adjusted.to_numpy(dtype=float, copy=True)
+    values[iu] = out
+    # Mirror the upper triangle back onto the lower triangle.
+    values[(iu[1], iu[0])] = out
+
+    return pd.DataFrame(values, index=pval_matrix.index, columns=pval_matrix.columns)
